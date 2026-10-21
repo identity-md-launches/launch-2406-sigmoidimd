@@ -9,6 +9,8 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SigmoidIMD} from "../src/SigmoidIMD.sol";
@@ -110,6 +112,110 @@ contract SigmoidLaunchpadTest is SigmoidTestBase {
         launchpad.launch("Bad", "BAD", SQRT_PRICE_1_1, -600, 600);
     }
 
+    function test_launchRejectsRangeWithAGapFromTheOpeningPrice() public {
+        (bool nextTokenIs0,,,) = _singleSidedParams();
+        // Right side, but starting 3000 ticks (35% / 26%) away from the opening price: the first buy would jump
+        // the gap and trip the breaker for the whole window.
+        (int24 lower, int24 upper) = nextTokenIs0 ? (int24(3000), MAX_TICK) : (MIN_TICK, int24(-3000));
+        vm.expectRevert(SigmoidLaunchpad.RangeNotAtOpeningPrice.selector);
+        launchpad.launch("Bad", "BAD", SQRT_PRICE_1_1, lower, upper);
+    }
+
+    function test_launchAtTickOpensAtTheTokenPriceWhicheverSideItSortsOn() public {
+        int24 priceTick = 6000; // 1.0001^6000 = 1.822 IMD per token
+        vm.prank(creator);
+        (uint256 id, address launched, PoolKey memory k) =
+            launchpad.launchAtTick("Tick Coin", "TICK", priceTick, 60_000);
+        bool is0 = Currency.unwrap(k.currency0) == launched;
+        (uint160 sqrtPrice, int24 tick,,) = IPoolManager(address(manager)).getSlot0(k.toId());
+        assertEq(tick, is0 ? priceTick : -priceTick, "pool tick is the token price tick on the token's side");
+        assertEq(sqrtPrice, TickMath.getSqrtPriceAtTick(is0 ? priceTick : -priceTick));
+        SigmoidLaunchpad.LaunchInfo memory info = launchpad.launches(id);
+        assertEq(info.tickLower, is0 ? priceTick : -priceTick - 60_000);
+        assertEq(info.tickUpper, is0 ? priceTick + 60_000 : -priceTick);
+        assertGt(info.liquidity, 0);
+        assertEq(info.creator, creator);
+        assertGt(IERC20(launched).balanceOf(address(manager)), 1e27 - 1e6, "whole supply seeded");
+
+        // The first buy trades at about the opening price: 1 IMD buys about 1/1.822 tokens minus the LP fee.
+        key = k;
+        poolId = k.toId();
+        tokenIs0 = is0;
+        IERC20(launched).approve(address(swapRouter), type(uint256).max);
+        BalanceDelta d = _buyExactOut(alice, 1e18);
+        uint256 paid = _abs(_imdDelta(d));
+        uint256 expected = uint256(1.822e18) * 1e6 / (1e6 - 3_000); // opening price plus the 0.30% LP fee
+        assertApproxEqRel(paid, expected, 2e15, "paid at the opening price");
+    }
+
+    function test_launchAtTickIsIndependentOfTheNonce() public {
+        // Two launches in a row land on whichever side their addresses sort to; both open at 1:1 with the range
+        // starting at the opening price, with no side to predict.
+        (, address a, PoolKey memory ka) = launchpad.launchAtTick("A", "A", 0, MAX_TICK);
+        (, address b, PoolKey memory kb) = launchpad.launchAtTick("B", "B", 0, MAX_TICK);
+        (uint160 pa,,,) = IPoolManager(address(manager)).getSlot0(ka.toId());
+        (uint160 pb,,,) = IPoolManager(address(manager)).getSlot0(kb.toId());
+        assertEq(pa, SQRT_PRICE_1_1);
+        assertEq(pb, SQRT_PRICE_1_1);
+        assertEq(hook.launches(ka.toId()).token, a);
+        assertEq(hook.launches(kb.toId()).token, b);
+    }
+
+    function test_launchAtTickRejectsUnalignedTicks() public {
+        vm.expectRevert(SigmoidLaunchpad.TickNotAligned.selector);
+        launchpad.launchAtTick("X", "X", 30, 600);
+        vm.expectRevert(SigmoidLaunchpad.TickNotAligned.selector);
+        launchpad.launchAtTick("X", "X", 0, 630);
+        vm.expectRevert(SigmoidLaunchpad.TickNotAligned.selector);
+        launchpad.launchAtTick("X", "X", 0, 0);
+        vm.expectRevert(SigmoidLaunchpad.TickNotAligned.selector);
+        launchpad.launchAtTick("X", "X", 0, -600);
+    }
+
+    /// @dev A swap of 1 wei of the token into the empty side of the pool: fills nothing, only slides the price.
+    function _push(address origin, uint256 sqrtRatioBps) internal {
+        uint160 cur = _sqrtPrice();
+        uint160 limit =
+            tokenIs0 ? uint160(uint256(cur) * 10_000 / sqrtRatioBps) : uint160(uint256(cur) * sqrtRatioBps / 10_000);
+        vm.prank(address(this), origin);
+        swapRouter.swap(
+            key,
+            SwapParams({zeroForOne: tokenIs0, amountSpecified: -1, sqrtPriceLimitX96: limit}),
+            PoolSwapTest.TestSettings(false, false),
+            ""
+        );
+    }
+
+    function test_zeroFillPushIsNotSettledAndDoesNotTripTheBreaker() public {
+        _launch();
+        uint160 opening = _sqrtPrice();
+        _push(address(0xA1), 11_135); // sqrt ratio 1.1135: a 24% price move, for free, inside the window
+        _push(address(0xA2), 11_135);
+        assertTrue(_sqrtPrice() != opening, "the pool price slid");
+        SigmoidIMD.Launch memory l = hook.launches(poolId);
+        assertEq(l.lastSettledSqrtPriceX96, opening, "nothing settled");
+        assertEq(l.latestSqrtPriceX96, opening);
+        assertEq(IERC20(hook.launches(poolId).token).balanceOf(treasury), 0, "no surcharge on a zero fill");
+        // An ordinary buy still goes through and is measured from the opening price.
+        BalanceDelta d = _buyExactOut(alice, 1e24);
+        assertEq(uint256(uint128(_tokenDelta(d))), 1e24);
+        assertLt(hook.tokenPriceImpactPips(tokenIs0, opening, _sqrtPrice()), 10_000);
+    }
+
+    function test_zeroFillPushDoesNotChangeTheNextBuyersFee() public {
+        (, address launched) = _launch();
+        _closeWindow();
+        uint256 snap = vm.snapshotState();
+        BalanceDelta d = _buy(alice, 1e24);
+        uint256 netUntouched = uint256(uint128(_tokenDelta(d)));
+        uint256 feeUntouched = IERC20(launched).balanceOf(treasury);
+        vm.revertToState(snap);
+        _push(address(0xA1), 30_000); // sqrt ratio 3: price slid 9x into the empty side
+        d = _buy(alice, 1e24);
+        assertEq(uint256(uint128(_tokenDelta(d))), netUntouched, "same output as on the untouched pool");
+        assertEq(IERC20(launched).balanceOf(treasury), feeUntouched, "same fee as on the untouched pool");
+    }
+
     function test_unknownLaunchReverts() public {
         vm.expectRevert(SigmoidLaunchpad.UnknownLaunch.selector);
         launchpad.launches(0);
@@ -150,7 +256,7 @@ contract SigmoidLaunchpadTest is SigmoidTestBase {
         BalanceDelta d = _buy(alice, 1e24);
         uint256 netOut = uint256(uint128(_tokenDelta(d)));
         uint256 fee = IERC20(launched).balanceOf(treasury);
-        uint256 surcharge = hook.surchargePips(hook.priceImpactPips(before, _sqrtPrice()));
+        uint256 surcharge = hook.surchargePips(hook.tokenPriceImpactPips(tokenIs0, before, _sqrtPrice()));
         assertGt(fee, 0, "the output token is in the pool, so it is paid out at once");
         assertEq(fee, (netOut + fee) * surcharge / 1e6);
         assertEq(hook.pendingFees(Currency.wrap(launched)), 0);
@@ -169,15 +275,20 @@ contract SigmoidLaunchpadTest is SigmoidTestBase {
         _buyExactOut(alice, 1e24);
     }
 
-    function test_sellBeforeAnyBuyFindsNoLiquidity() public {
+    function test_sellingBackEverythingBoughtCannotDrainThePool() public {
         (, address launched) = _launch();
+        uint160 opening = _sqrtPrice();
         IERC20(launched).approve(address(swapRouter), type(uint256).max);
-        // The creator holds only dust; mint-less token, so borrow some by buying first, then try to push the
-        // price into the empty side: the swap has nothing to fill and the router refuses it.
+        // Every token outside the pool came out of it, and the LP fee keeps a little IMD behind on each buy, so
+        // selling back everything that was bought never exhausts the pool's IMD: the price returns to about the
+        // opening, stays inside the liquidity, and the breaker does not trip.
         _buyExactOut(alice, 1e24);
         vm.roll(block.number + 3);
-        vm.expectRevert();
-        _sell(alice, 2e24);
+        BalanceDelta d = _sell(alice, 1e24);
+        assertEq(_abs(_tokenDelta(d)), 1e24, "fully filled");
+        assertGt(IPoolManager(address(manager)).getLiquidity(poolId), 0, "the price is still inside the range");
+        assertApproxEqRel(uint256(_sqrtPrice()), uint256(opening), 1e15);
+        assertEq(hook.launches(poolId).latestSqrtPriceX96, _sqrtPrice());
     }
 
     function test_collectFeesPaysCreatorOnly() public {

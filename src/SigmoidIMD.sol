@@ -8,6 +8,10 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {FullMath} from "v4-core/src/libraries/FullMath.sol";
+import {BitMath} from "v4-core/src/libraries/BitMath.sol";
+import {TickBitmap} from "v4-core/src/libraries/TickBitmap.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {SafeCast} from "v4-core/src/libraries/SafeCast.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
@@ -24,15 +28,23 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///
 ///  1. Dynamic swap fee. On a dynamic-fee pool the LP fee is pinned to `BASE_LP_FEE` (0.30%). On top of the LP
 ///     fee the hook charges a surcharge of `IMPACT_MULTIPLIER` x the swap's price impact, so that the total fee
-///     is 0.30% + 150 x impact, capped at `MAX_TOTAL_FEE` (90%). The surcharge is taken from the swap's
-///     unspecified currency with `afterSwapReturnDelta` and sent to the immutable `treasury`. The surcharge
-///     applies inside and outside the window.
-///  2. Circuit breaker. Inside the window any swap that would move the pool price by more than
+///     is 0.30% + 150 x impact, capped at `MAX_TOTAL_FEE` (90%) whatever the pool's LP fee. The surcharge is
+///     taken from the swap's unspecified currency with `afterSwapReturnDelta` and sent to the immutable
+///     `treasury`. It applies inside and outside the window.
+///  2. Circuit breaker. Inside the window any swap that would move the launch token's price by more than
 ///     `MAX_PRICE_MOVE_PIPS` (25%) from the last settled price reverts.
 ///  3. Wallet protection. Inside the window a wallet (`tx.origin`) may buy at most `MAX_BUY_BPS` (0.5%) of the
 ///     launch token's total supply in total and may swap at most once every `SWAP_COOLDOWN_BLOCKS` blocks.
 ///
 /// Outside the window only the dynamic fee remains. The hook has no owner and no switches.
+///
+/// Price impact is always the move of the launch token's price in the pair currency (normalised for which
+/// currency the token sorts as), measured from the price settled at the end of the last block that had a filled
+/// swap. Every swap in one block is measured from that block anchor, so splitting a trade within a block does
+/// not reduce the surcharge or evade the breaker. A swap that fills nothing (it only slid the pool price through
+/// a region with no liquidity) is ignored entirely: it is not settled, not breaker-checked and not surcharged.
+/// A swap that ends in a region with no liquidity is measured and settled at the edge of the liquidity it
+/// consumed, not at the price it slid to.
 ///
 /// @dev Callbacks enabled: beforeInitialize, beforeSwap, afterSwap, afterSwapReturnDelta. The pool manager
 /// and the pair currency are constructor arguments; nothing is hardcoded. The constructor calls no other
@@ -42,6 +54,7 @@ contract SigmoidIMD is IHooks, IUnlockCallback {
     using StateLibrary for IPoolManager;
     using CurrencyLibrary for Currency;
     using LPFeeLibrary for uint24;
+    using SafeCast for uint256;
 
     // ------------------------------------------------------------------------------------------------------
     // Errors
@@ -96,8 +109,13 @@ contract SigmoidIMD is IHooks, IUnlockCallback {
     uint24 public constant MAX_TOTAL_FEE = 900_000;
     /// @notice Largest price move allowed by one swap inside the window: 25%.
     uint256 public constant MAX_PRICE_MOVE_PIPS = 250_000;
-    /// @notice Saturation value for the price impact when the move is astronomically large.
+    /// @notice Saturation value for the price impact when the move is astronomically large (a 1e12x price move).
     uint256 internal constant IMPACT_SATURATION = 1e18;
+    /// @notice Sqrt-price ratio (1e6x, so a 1e12x price move) above which the impact saturates.
+    uint256 internal constant SQRT_RATIO_SATURATION = 1e6;
+    /// @notice Most tick-bitmap words scanned to find the liquidity edge a sliding swap came from. 128 words cover
+    /// the whole tick range at tick spacing 60; a wider search gives up and uses the raw pool price.
+    uint256 internal constant MAX_EDGE_WORDS = 128;
 
     // ------------------------------------------------------------------------------------------------------
     // Immutables
@@ -117,12 +135,18 @@ contract SigmoidIMD is IHooks, IUnlockCallback {
         address token;
         bool tokenIsCurrency0;
         uint64 creationBlock;
+        /// @dev The block anchor: the price every swap in the current block is measured from. It is the price
+        /// settled by the last filled swap of an earlier block (the opening price before any swap).
         uint160 lastSettledSqrtPriceX96;
+        /// @dev The price after the latest filled swap; becomes the anchor when a later block has a filled swap.
+        uint160 latestSqrtPriceX96;
+        /// @dev Block of the latest filled swap (the creation block before any swap).
+        uint64 latestBlock;
         uint256 maxBuyPerWallet;
     }
 
     mapping(PoolId poolId => Launch) internal _launches;
-    /// @notice Launch tokens bought by a wallet inside the window, net of the hook's fee.
+    /// @notice Launch tokens a wallet took out of the pool inside the window, gross of the hook's fee.
     mapping(PoolId poolId => mapping(address wallet => uint256)) public boughtInWindow;
     /// @notice Block of a wallet's last swap inside the window (0 = never).
     mapping(PoolId poolId => mapping(address wallet => uint256)) public lastSwapBlock;
@@ -182,22 +206,89 @@ contract SigmoidIMD is IHooks, IUnlockCallback {
         return block.number < uint256(l.creationBlock) + OPENING_WINDOW_BLOCKS;
     }
 
-    /// @notice Price impact in pips of moving from one sqrt price to another: |p1 - p0| / p0.
-    /// @dev Saturates at `IMPACT_SATURATION` for moves above 1e12x so it can never revert.
+    /// @notice Price impact in pips of moving from one sqrt price to another: |p1 - p0| / p0 with p = sqrt^2.
+    /// @dev Computed on the sqrt prices at full precision (no truncation near MIN_SQRT_PRICE). Saturates at
+    /// `IMPACT_SATURATION` for moves above 1e12x so it can never revert.
     function priceImpactPips(uint160 sqrtPriceBeforeX96, uint160 sqrtPriceAfterX96) public pure returns (uint256) {
-        uint256 pBefore = FullMath.mulDiv(sqrtPriceBeforeX96, sqrtPriceBeforeX96, 1 << 64);
-        uint256 pAfter = FullMath.mulDiv(sqrtPriceAfterX96, sqrtPriceAfterX96, 1 << 64);
-        if (pBefore == 0) return pAfter == 0 ? 0 : IMPACT_SATURATION;
-        uint256 diff = pAfter > pBefore ? pAfter - pBefore : pBefore - pAfter;
-        if (diff / pBefore >= IMPACT_SATURATION / PIPS) return IMPACT_SATURATION;
-        return FullMath.mulDiv(diff, PIPS, pBefore);
+        uint256 s0 = sqrtPriceBeforeX96;
+        uint256 s1 = sqrtPriceAfterX96;
+        if (s0 == 0) return s1 == 0 ? 0 : IMPACT_SATURATION;
+        if (s1 >= s0 * SQRT_RATIO_SATURATION) return IMPACT_SATURATION;
+        // ratio = p1 / p0 in pips = s1^2 / s0^2 * 1e6; s1 < s0 * 1e6 so s1^2 / s0 < 2^200 and nothing overflows.
+        uint256 ratioPips = FullMath.mulDiv(FullMath.mulDiv(s1, s1, s0), PIPS, s0);
+        return ratioPips >= PIPS ? ratioPips - PIPS : PIPS - ratioPips;
     }
 
-    /// @notice The surcharge, in pips of the unspecified amount, for a given price impact.
+    /// @notice The move of the launch token's price, in pips, between two pool sqrt prices.
+    /// @dev The pool price is currency1 per currency0. When the token is currency1 its price in the pair currency
+    /// is the inverse, so the roles of before and after swap: |1/p1 - 1/p0| / (1/p0) = |p0 - p1| / p1.
+    function tokenPriceImpactPips(bool tokenIsCurrency0, uint160 sqrtPriceBeforeX96, uint160 sqrtPriceAfterX96)
+        public
+        pure
+        returns (uint256)
+    {
+        return tokenIsCurrency0
+            ? priceImpactPips(sqrtPriceBeforeX96, sqrtPriceAfterX96)
+            : priceImpactPips(sqrtPriceAfterX96, sqrtPriceBeforeX96);
+    }
+
+    /// @notice The surcharge, in pips, for a given price impact on a pool whose LP fee is `BASE_LP_FEE`.
     function surchargePips(uint256 impactPips) public pure returns (uint256) {
+        return surchargePips(impactPips, BASE_LP_FEE);
+    }
+
+    /// @notice The surcharge, in pips, for a given price impact on a pool with LP fee `lpFee`: 150 x impact,
+    /// capped so that LP fee + surcharge never exceeds `MAX_TOTAL_FEE`.
+    function surchargePips(uint256 impactPips, uint24 lpFee) public pure returns (uint256) {
         uint256 raw = impactPips * IMPACT_MULTIPLIER;
-        uint256 cap = uint256(MAX_TOTAL_FEE) - uint256(BASE_LP_FEE);
+        uint256 cap = lpFee < MAX_TOTAL_FEE ? uint256(MAX_TOTAL_FEE) - uint256(lpFee) : 0;
         return raw > cap ? cap : raw;
+    }
+
+    /// @notice The surcharge amount for an unspecified amount of `amount` at `surcharge` pips.
+    /// @dev When the unspecified currency is the swap's output (exact input) the fee is taken out of it, so the
+    /// treasury keeps `surcharge` of the gross output. When it is the input (exact output) the fee is added on
+    /// top, so it is scaled up to `amount x s / (1 - s)`: the treasury then keeps `surcharge` of what the trader
+    /// pays in total, the same share as on an exact-input swap.
+    function surchargeAmount(uint256 amount, uint256 surcharge, bool unspecifiedIsInput) public pure returns (uint256) {
+        if (surcharge >= PIPS) return 0; // unreachable: the cap is below 100%
+        return unspecifiedIsInput
+            ? FullMath.mulDiv(amount, surcharge, PIPS - surcharge)
+            : FullMath.mulDiv(amount, surcharge, PIPS);
+    }
+
+    /// @notice The nearest initialized tick on the side a swap in direction `zeroForOne` came from: strictly above
+    /// `tick` after a zeroForOne swap, at or below it otherwise. Used when a swap ends in a region with no
+    /// liquidity, where the pool price is wherever the swap slid to and the real price is the liquidity edge.
+    /// @return found False when no initialized tick lies within `MAX_EDGE_WORDS` words.
+    /// @return edgeTick The initialized tick, when found.
+    function liquidityEdge(PoolId poolId, int24 tick, int24 tickSpacing, bool zeroForOne)
+        public
+        view
+        returns (bool found, int24 edgeTick)
+    {
+        int24 compressed = TickBitmap.compress(tick, tickSpacing);
+        if (zeroForOne) compressed += 1;
+        for (uint256 i = 0; i < MAX_EDGE_WORDS; i++) {
+            if (int256(compressed) * tickSpacing > TickMath.MAX_TICK) break;
+            if (int256(compressed) * tickSpacing < TickMath.MIN_TICK) break;
+            (int16 wordPos, uint8 bitPos) = TickBitmap.position(compressed);
+            uint256 word = poolManager.getTickBitmap(poolId, wordPos);
+            int24 wordStart = compressed - int24(uint24(bitPos));
+            if (zeroForOne) {
+                uint256 masked = word & (type(uint256).max << bitPos); // bits at or above bitPos
+                if (masked != 0) {
+                    return (true, (wordStart + int24(uint24(BitMath.leastSignificantBit(masked)))) * tickSpacing);
+                }
+                compressed = wordStart + 256;
+            } else {
+                uint256 masked = word & ((uint256(1) << bitPos) | ((uint256(1) << bitPos) - 1)); // at or below
+                if (masked != 0) {
+                    return (true, (wordStart + int24(uint24(BitMath.mostSignificantBit(masked)))) * tickSpacing);
+                }
+                compressed = wordStart - 1;
+            }
+        }
     }
 
     // ------------------------------------------------------------------------------------------------------
@@ -232,6 +323,8 @@ contract SigmoidIMD is IHooks, IUnlockCallback {
             tokenIsCurrency0: pairIs1,
             creationBlock: uint64(block.number),
             lastSettledSqrtPriceX96: sqrtPriceX96,
+            latestSqrtPriceX96: sqrtPriceX96,
+            latestBlock: uint64(block.number),
             maxBuyPerWallet: cap
         });
         emit LaunchRegistered(poolId, token, block.number, cap);
@@ -264,65 +357,93 @@ contract SigmoidIMD is IHooks, IUnlockCallback {
     }
 
     /// @inheritdoc IHooks
-    /// @dev Measures the swap's price impact against the last settled price, trips the circuit breaker and the
-    /// wallet buy cap inside the window, charges the surcharge on the unspecified currency and settles the new
-    /// price.
+    /// @dev Ignores swaps that filled nothing. Otherwise measures the launch token's price move against the block
+    /// anchor, trips the circuit breaker and the wallet buy cap inside the window, charges the surcharge on the
+    /// unspecified currency and records the new price.
     function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         override
         onlyPoolManager
         returns (bytes4, int128)
     {
+        if (delta.amount0() == 0 && delta.amount1() == 0) return (IHooks.afterSwap.selector, 0);
         bool specifiedIs0 = (params.amountSpecified < 0) == params.zeroForOne;
-        uint256 fee = _afterSwap(key.toId(), specifiedIs0 ? key.currency1 : key.currency0, specifiedIs0, delta);
-        return (IHooks.afterSwap.selector, int128(uint128(fee)));
+        uint24 lpFee = key.fee.isDynamicFee() ? BASE_LP_FEE : key.fee;
+        uint256 fee = _afterSwap(
+            key.toId(),
+            specifiedIs0 ? key.currency1 : key.currency0,
+            specifiedIs0,
+            params.amountSpecified > 0,
+            params.zeroForOne,
+            key.tickSpacing,
+            lpFee,
+            delta
+        );
+        return (IHooks.afterSwap.selector, fee.toInt128());
     }
 
     /// @dev The body of `afterSwap`, with the calldata structs reduced to what it needs.
-    function _afterSwap(PoolId poolId, Currency feeCurrency, bool specifiedIs0, BalanceDelta delta)
-        internal
-        returns (uint256 fee)
-    {
+    function _afterSwap(
+        PoolId poolId,
+        Currency feeCurrency,
+        bool specifiedIs0,
+        bool exactOutput,
+        bool zeroForOne,
+        int24 tickSpacing,
+        uint24 lpFee,
+        BalanceDelta delta
+    ) internal returns (uint256 fee) {
         Launch storage l = _launches[poolId];
         if (l.token == address(0)) revert UnknownPool();
 
-        (uint256 impact, uint160 sqrtPriceAfter) = _measureImpact(poolId, l);
+        (uint256 impact, uint160 sqrtPriceAfter) = _measureImpact(poolId, l, zeroForOne, tickSpacing);
 
         // The surcharge comes out of the unspecified currency: the output of an exact-input swap, the input of
-        // an exact-output swap.
-        uint256 surcharge = surchargePips(impact);
-        fee = _abs(specifiedIs0 ? delta.amount1() : delta.amount0()) * surcharge / PIPS;
+        // an exact-output swap. On exact output it is scaled so the treasury's share of what the trader pays is
+        // the same as on exact input.
+        uint256 surcharge = surchargePips(impact, lpFee);
+        fee = surchargeAmount(_abs(specifiedIs0 ? delta.amount1() : delta.amount0()), surcharge, exactOutput);
 
-        _enforceBuyCap(poolId, l, delta, specifiedIs0, fee);
+        _enforceBuyCap(poolId, l, delta);
         if (fee > 0) _collect(poolId, feeCurrency, fee, impact, surcharge);
 
-        l.lastSettledSqrtPriceX96 = sqrtPriceAfter;
+        l.latestSqrtPriceX96 = sqrtPriceAfter;
         emit PriceSettled(poolId, sqrtPriceAfter);
     }
 
-    /// @dev Reads the post-swap price, computes the impact against the settled price and trips the breaker.
-    function _measureImpact(PoolId poolId, Launch storage l)
+    /// @dev Moves the block anchor forward when this is the first filled swap of a new block, reads the post-swap
+    /// price (the liquidity edge when the swap slid into empty space), computes the token's price move against
+    /// the anchor and trips the breaker inside the window.
+    function _measureImpact(PoolId poolId, Launch storage l, bool zeroForOne, int24 tickSpacing)
         internal
-        view
         returns (uint256 impact, uint160 sqrtPriceAfter)
     {
-        (sqrtPriceAfter,,,) = poolManager.getSlot0(poolId);
-        uint160 sqrtPriceBefore = l.lastSettledSqrtPriceX96;
-        impact = priceImpactPips(sqrtPriceBefore, sqrtPriceAfter);
+        if (l.latestBlock != uint64(block.number)) {
+            l.lastSettledSqrtPriceX96 = l.latestSqrtPriceX96;
+            l.latestBlock = uint64(block.number);
+        }
+        uint160 anchor = l.lastSettledSqrtPriceX96;
+
+        int24 tick;
+        (sqrtPriceAfter, tick,,) = poolManager.getSlot0(poolId);
+        if (poolManager.getLiquidity(poolId) == 0) {
+            (bool found, int24 edge) = liquidityEdge(poolId, tick, tickSpacing, zeroForOne);
+            if (found) sqrtPriceAfter = TickMath.getSqrtPriceAtTick(edge);
+        }
+
+        impact = tokenPriceImpactPips(l.tokenIsCurrency0, anchor, sqrtPriceAfter);
         bool inWindow = block.number < uint256(l.creationBlock) + OPENING_WINDOW_BLOCKS;
-        if (inWindow && impact > MAX_PRICE_MOVE_PIPS) revert CircuitBreaker(sqrtPriceBefore, sqrtPriceAfter, impact);
+        if (inWindow && impact > MAX_PRICE_MOVE_PIPS) revert CircuitBreaker(anchor, sqrtPriceAfter, impact);
     }
 
-    /// @dev Inside the window, counts what the wallet receives of the launch token and enforces the cap.
-    function _enforceBuyCap(PoolId poolId, Launch storage l, BalanceDelta delta, bool specifiedIs0, uint256 fee)
-        internal
-    {
+    /// @dev Inside the window, counts every launch token the swap takes out of the pool for the wallet, gross of
+    /// the hook's fee (the fee is taken from that output when the token is the unspecified currency), and
+    /// enforces the cap.
+    function _enforceBuyCap(PoolId poolId, Launch storage l, BalanceDelta delta) internal {
         if (block.number >= uint256(l.creationBlock) + OPENING_WINDOW_BLOCKS) return;
         int128 tokenDelta = l.tokenIsCurrency0 ? delta.amount0() : delta.amount1();
         if (tokenDelta <= 0) return;
         uint256 received = uint256(uint128(tokenDelta));
-        bool tokenIsUnspecified = l.tokenIsCurrency0 != specifiedIs0;
-        if (tokenIsUnspecified) received -= fee;
         address wallet = tx.origin;
         uint256 total = boughtInWindow[poolId][wallet] + received;
         if (total > l.maxBuyPerWallet) revert WalletBuyCapExceeded(wallet, total, l.maxBuyPerWallet);

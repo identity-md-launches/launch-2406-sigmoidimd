@@ -34,6 +34,8 @@ contract SigmoidLaunchpad is IUnlockCallback {
     error NotCreator();
     error UnknownLaunch();
     error RangeNotSingleSided();
+    error RangeNotAtOpeningPrice();
+    error TickNotAligned();
     error UnexpectedPairDelta(int128 amount);
     error ZeroLiquidity();
 
@@ -91,16 +93,45 @@ contract SigmoidLaunchpad is IUnlockCallback {
         return _launches[launchId];
     }
 
+    /// @notice Deploys a new token, opens its IMD pool on the hook and seeds the full supply single-sided, with
+    /// the opening given as the token's own price so the caller need not know which side the token sorts on.
+    /// @param name The token's name.
+    /// @param symbol The token's symbol.
+    /// @param tokenPriceTick The opening price of the token in IMD as a tick: 1.0001^tick IMD per token. A
+    /// multiple of `TICK_SPACING`.
+    /// @param rangeWidth Width of the seeded range in ticks, a positive multiple of `TICK_SPACING`. The range
+    /// starts at the opening price and extends `rangeWidth` ticks towards higher token prices.
+    /// @dev The pool price is currency1 per currency0. When the token sorts as currency0 the pool opens at
+    /// `tokenPriceTick` with the range above it; when it sorts as currency1 the pool opens at `-tokenPriceTick`
+    /// with the range below it. Either way the token trades at the same IMD price, so a launch that is mined
+    /// before this one and shifts the token's address cannot make the call revert.
+    function launchAtTick(string calldata name, string calldata symbol, int24 tokenPriceTick, int24 rangeWidth)
+        external
+        returns (uint256 launchId, address token, PoolKey memory key)
+    {
+        if (rangeWidth <= 0 || rangeWidth % TICK_SPACING != 0 || tokenPriceTick % TICK_SPACING != 0) {
+            revert TickNotAligned();
+        }
+        token = address(new FixedSupplyERC20(name, symbol));
+        bool tokenIs0 = token < Currency.unwrap(hook.pairCurrency());
+        int24 tickLower = tokenIs0 ? tokenPriceTick : -tokenPriceTick - rangeWidth;
+        int24 tickUpper = tokenIs0 ? tokenPriceTick + rangeWidth : -tokenPriceTick;
+        uint160 sqrtPriceX96 = TickMath.getSqrtPriceAtTick(tokenIs0 ? tokenPriceTick : -tokenPriceTick);
+        (launchId, key) = _launch(token, sqrtPriceX96, tickLower, tickUpper);
+    }
+
     /// @notice Deploys a new token, opens its IMD pool on the hook and seeds the full supply single-sided.
     /// @param name The token's name.
     /// @param symbol The token's symbol.
     /// @param sqrtPriceX96 The opening sqrt price of the pool (currency1 per currency0, Q64.96).
     /// @param tickLower Lower tick of the seeded range (multiple of `TICK_SPACING`).
     /// @param tickUpper Upper tick of the seeded range (multiple of `TICK_SPACING`).
-    /// @dev The range must lie entirely on the token side of the opening price: at or above it when the token is
-    /// currency0, at or below it when the token is currency1. Which side that is depends on how the new token's
-    /// address sorts against IMD. Callers predict the token address (CREATE from this contract's nonce) or
-    /// simulate the call first and pass the price and ticks for the side that results.
+    /// @dev The range must start exactly at the opening price and extend to the token side of it: `tickLower` is
+    /// the opening tick when the token is currency0, `tickUpper` when it is currency1, so the first buy trades at
+    /// the opening price rather than jumping to a distant range edge. Which side that is depends on how the new
+    /// token's address sorts against IMD. Callers predict the token address (CREATE from this contract's nonce)
+    /// or simulate the call first and pass the price and ticks for the side that results; `launchAtTick` does
+    /// that in-contract and is the recommended entry point.
     function launch(
         string calldata name,
         string calldata symbol,
@@ -109,6 +140,13 @@ contract SigmoidLaunchpad is IUnlockCallback {
         int24 tickUpper
     ) external returns (uint256 launchId, address token, PoolKey memory key) {
         token = address(new FixedSupplyERC20(name, symbol));
+        (launchId, key) = _launch(token, sqrtPriceX96, tickLower, tickUpper);
+    }
+
+    function _launch(address token, uint160 sqrtPriceX96, int24 tickLower, int24 tickUpper)
+        internal
+        returns (uint256 launchId, PoolKey memory key)
+    {
         bool tokenIs0;
         (key, tokenIs0) = _poolKey(token);
         poolManager.initialize(key, sqrtPriceX96);
@@ -151,6 +189,9 @@ contract SigmoidLaunchpad is IUnlockCallback {
     }
 
     /// @dev Liquidity that places `amount` of the token in [tickLower, tickUpper] with none of the pair currency.
+    /// The range must sit on the token side of the price and start exactly at it: a gap between the opening price
+    /// and the range would make the first buy jump the gap, which inside the window trips the breaker (a gap over
+    /// 25%) and otherwise pays the capped surcharge for a move no one caused.
     function _singleSidedLiquidity(
         bool tokenIs0,
         uint160 sqrtPriceX96,
@@ -162,9 +203,11 @@ contract SigmoidLaunchpad is IUnlockCallback {
         uint160 sqrtUpper = TickMath.getSqrtPriceAtTick(tickUpper);
         if (tokenIs0) {
             if (sqrtLower < sqrtPriceX96) revert RangeNotSingleSided();
+            if (sqrtLower != sqrtPriceX96) revert RangeNotAtOpeningPrice();
             liquidity = LiquidityAmounts.getLiquidityForAmount0(sqrtLower, sqrtUpper, amount);
         } else {
             if (sqrtUpper > sqrtPriceX96) revert RangeNotSingleSided();
+            if (sqrtUpper != sqrtPriceX96) revert RangeNotAtOpeningPrice();
             liquidity = LiquidityAmounts.getLiquidityForAmount1(sqrtLower, sqrtUpper, amount);
         }
         if (liquidity == 0) revert ZeroLiquidity();
