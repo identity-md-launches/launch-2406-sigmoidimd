@@ -13,6 +13,7 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SigmoidIMD} from "../../src/SigmoidIMD.sol";
 import {SigmoidLaunchpad} from "../../src/SigmoidLaunchpad.sol";
@@ -43,9 +44,12 @@ contract SigmoidHandler is Test {
     address[] public actors;
 
     // Ghost state.
-    mapping(address => uint256) public ghostBought; // tokens a wallet received from buys inside the window
+    mapping(address => uint256) public ghostBought; // tokens in-window buys took out of the pool, gross of fee
     mapping(address => uint256) public ghostLastSwap; // block of a wallet's last successful in-window swap
-    uint256 public breakerViolations; // in-window swaps that moved the raw price more than 25%
+    uint256 public breakerViolations; // in-window swaps that moved the token price more than 25% from the anchor
+    uint160 public ghostAnchor; // the price of the end of the last earlier block with a filled swap
+    uint160 public ghostLatest; // the hook's price after the latest filled swap
+    uint256 public ghostLatestBlock; // block of the latest filled swap
     uint256 public cooldownViolations; // in-window swaps by one wallet less than 3 blocks apart
     uint256 public capViolations; // a wallet's in-window buys above 0.5% of supply
     uint256 public unexpectedHookReverts; // the hook reverted with an error that is none of its three rules
@@ -80,6 +84,9 @@ contract SigmoidHandler is Test {
         imd_.mint(address(this), IMD_FUNDS);
         imd_.approve(address(router_), type(uint256).max);
         token.approve(address(router_), type(uint256).max);
+        (ghostAnchor,,,) = IPoolManager(address(manager_)).getSlot0(poolId);
+        ghostLatest = ghostAnchor;
+        ghostLatestBlock = block.number;
     }
 
     function actorCount() external view returns (uint256) {
@@ -135,7 +142,7 @@ contract SigmoidHandler is Test {
         address actor = actors[actorSeed % actors.length];
         (uint160 before,,,) = IPoolManager(address(manager)).getSlot0(poolId);
         bool inWindow = hook.inOpeningWindow(poolId);
-        uint256 tokenBefore = token.balanceOf(address(this));
+        uint256 grossBefore = _tokensOutOfPool();
 
         uint160 limit;
         if (limited) {
@@ -153,22 +160,45 @@ contract SigmoidHandler is Test {
             SwapParams({zeroForOne: zeroForOne, amountSpecified: amountSpecified, sqrtPriceLimitX96: limit}),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             ""
+        ) returns (
+            BalanceDelta delta
         ) {
             successfulSwaps++;
-            (uint160 afterPrice,,,) = IPoolManager(address(manager)).getSlot0(poolId);
+            bool filled = delta.amount0() != 0 || delta.amount1() != 0;
+            if (filled) {
+                // The anchor moves to the previous latest price on the first filled swap of a new block.
+                if (block.number != ghostLatestBlock) {
+                    ghostAnchor = ghostLatest;
+                    ghostLatestBlock = block.number;
+                }
+                ghostLatest = hook.launches(poolId).latestSqrtPriceX96;
+            }
             if (!inWindow) return;
-            if (_rawMoveOver25Percent(before, afterPrice)) breakerViolations++;
+            if (filled && _tokenMoveOver25Percent(ghostAnchor, ghostLatest)) breakerViolations++;
             uint256 last = ghostLastSwap[actor];
             if (last != 0 && block.number < last + 3) cooldownViolations++;
             ghostLastSwap[actor] = block.number;
-            uint256 tokenAfter = token.balanceOf(address(this));
-            if (tokenAfter > tokenBefore) {
-                ghostBought[actor] += tokenAfter - tokenBefore;
+            uint256 grossAfter = _tokensOutOfPool();
+            if (grossAfter > grossBefore) {
+                ghostBought[actor] += grossAfter - grossBefore;
                 if (ghostBought[actor] > token.totalSupply() / 200) capViolations++;
             }
         } catch (bytes memory reason) {
             _classify(reason);
         }
+    }
+
+    /// @dev Launch tokens held outside the pool by the traders and the treasury, counting the treasury's
+    /// unredeemed claims: what a buy takes out of the pool, before and after the hook's fee is split off.
+    function _tokensOutOfPool() internal view returns (uint256) {
+        return token.balanceOf(address(this)) + token.balanceOf(hook.treasury())
+            + hook.pendingFees(Currency.wrap(address(token)));
+    }
+
+    /// @dev The move of the launch token's price in IMD. The pool price is currency1 per currency0, so when the
+    /// token is currency1 its price is the inverse: |1/p1 - 1/p0| / (1/p0) = |p0 - p1| / p1.
+    function _tokenMoveOver25Percent(uint160 s0, uint160 s1) internal view returns (bool) {
+        return tokenIs0 ? _rawMoveOver25Percent(s0, s1) : _rawMoveOver25Percent(s1, s0);
     }
 
     /// @dev |p1 - p0| > p0 / 4 on the raw price p = sqrtP^2, computed with the sqrt prices squared in Q64.
@@ -309,15 +339,29 @@ contract SigmoidInvariantTest is Test {
     /// forge-config: default.invariant.runs = 128
     /// forge-config: default.invariant.depth = 40
     function invariant_settledPriceTracksThePool() public view {
+        SigmoidIMD.Launch memory l = hook.launches(poolId);
+        assertEq(l.token, address(token));
+        assertEq(l.lastSettledSqrtPriceX96, handler.ghostAnchor(), "anchor == end price of an earlier block");
+        assertEq(l.latestSqrtPriceX96, handler.ghostLatest());
         (uint160 sqrtPriceX96,,,) = IPoolManager(address(manager)).getSlot0(poolId);
-        assertEq(hook.launches(poolId).lastSettledSqrtPriceX96, sqrtPriceX96, "settled price == pool price");
-        assertEq(hook.launches(poolId).token, address(token));
+        if (IPoolManager(address(manager)).getLiquidity(poolId) > 0) {
+            assertEq(l.latestSqrtPriceX96, sqrtPriceX96, "with liquidity in range, the latest price is the pool's");
+        } else {
+            // Outside the only position the latest price is that position's edge, never wherever the pool slid.
+            assertTrue(
+                l.latestSqrtPriceX96 == TickMath.getSqrtPriceAtTick(info.tickLower)
+                    || l.latestSqrtPriceX96 == TickMath.getSqrtPriceAtTick(info.tickUpper),
+                "out of range, the latest price is the liquidity edge"
+            );
+        }
     }
 
     /// forge-config: default.invariant.runs = 128
     /// forge-config: default.invariant.depth = 40
     function invariant_windowRulesHold() public view {
-        assertEq(handler.breakerViolations(), 0, "an in-window swap moved the raw price more than 25%");
+        assertEq(
+            handler.breakerViolations(), 0, "an in-window swap moved the token price more than 25% from the anchor"
+        );
         assertEq(handler.cooldownViolations(), 0, "a wallet swapped twice within 3 blocks in the window");
         assertEq(handler.capViolations(), 0, "a wallet bought more than 0.5% of supply in the window");
         assertEq(handler.unexpectedHookReverts(), 0, "the hook reverted for a reason that is not a rule");
@@ -326,7 +370,7 @@ contract SigmoidInvariantTest is Test {
         for (uint256 i = 0; i < handler.actorCount(); i++) {
             address a = handler.actors(i);
             uint256 counted = hook.boughtInWindow(poolId, a);
-            assertEq(counted, handler.ghostBought(a), "hook counts exactly what the wallet received");
+            assertEq(counted, handler.ghostBought(a), "hook counts exactly what the wallet took out of the pool");
             assertLe(counted, cap);
         }
     }

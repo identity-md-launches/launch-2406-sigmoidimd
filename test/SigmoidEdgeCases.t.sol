@@ -7,6 +7,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
@@ -136,11 +137,26 @@ contract SigmoidHookEdgeTest is SigmoidTestBase {
         uint256 gross = net + fee;
         assertLe(fee * 1e6, gross * 897_000, "surcharge <= 89.7% of gross output");
         assertGe(net * 1e6, gross * 103_000 - 1e6, "trader keeps >= 10.3% of gross output");
-        // The fee matches the formula for the measured impact (an oracle, not the hook's arithmetic: the impact
-        // comes from the pool's prices before and after).
-        uint256 impact = hook.priceImpactPips(before, _sqrtPrice());
-        uint256 expectedPips = impact * 150 > 897_000 ? 897_000 : impact * 150;
-        assertEq(fee, gross * expectedPips / 1e6);
+        // The fee matches the formula for the launch token's price move (an oracle, not the hook's arithmetic:
+        // the impact comes from the pool's prices before and after, computed here on squared prices, so it may
+        // round one pip away from the hook's).
+        uint256 impact = _tokenImpactPips(before, _sqrtPrice());
+        uint256 lo = impact == 0 ? 0 : (impact - 1) * 150;
+        uint256 hi = (impact + 1) * 150;
+        if (lo > 897_000) lo = 897_000;
+        if (hi > 897_000) hi = 897_000;
+        assertGe(fee + 1, gross * lo / 1e6, "fee >= formula");
+        assertLe(fee, gross * hi / 1e6 + 1, "fee <= formula");
+    }
+
+    /// @dev |q1 - q0| / q0 in pips for the launch token's price q in IMD: q = p when the token is currency0,
+    /// q = 1 / p when it is currency1, with p = sqrtP^2 the pool price (computed in Q64).
+    function _tokenImpactPips(uint160 s0, uint160 s1) internal view returns (uint256) {
+        uint256 p0 = FullMath.mulDiv(s0, s0, 1 << 128);
+        uint256 p1 = FullMath.mulDiv(s1, s1, 1 << 128);
+        (uint256 from, uint256 to) = tokenIs0 ? (p0, p1) : (p1, p0);
+        uint256 diff = to > from ? to - from : from - to;
+        return diff * 1e6 / from;
     }
 
     function test_staticFeePoolIsNotOverridden() public {
@@ -189,8 +205,15 @@ contract SigmoidHookEdgeTest is SigmoidTestBase {
             );
         if (ok) {
             assertLe(hook.boughtInWindow(poolId, alice), cap);
-            assertEq(hook.boughtInWindow(poolId, alice), token.balanceOf(address(this)) - _ownTokensBefore());
-            assertLe(hook.priceImpactPips(before, _sqrtPrice()), 250_000);
+            // Counted gross of the hook's fee: what the wallet received plus the surcharge taken in the token
+            // (exact input), paid out to the treasury or held as a claim.
+            uint256 surchargeInToken = token.balanceOf(treasury) + hook.pendingFees(Currency.wrap(address(token)));
+            if (exactOut) assertEq(surchargeInToken, 0, "exact-output buys pay the surcharge in IMD");
+            assertEq(
+                hook.boughtInWindow(poolId, alice),
+                token.balanceOf(address(this)) - _ownTokensBefore() + surchargeInToken
+            );
+            assertLe(_tokenImpactPips(before, _sqrtPrice()), 250_000);
         } else {
             (address target,, bytes memory inner,) = _unwrap(reason);
             assertEq(target, address(hook));
